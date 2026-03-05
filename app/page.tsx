@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Copy, Check, Sparkles, Zap, RotateCcw, Clock,
-  ChevronDown, ChevronUp, BookOpen, X, Upload, FileText, Trash2
+  ChevronDown, ChevronUp, BookOpen, Upload, FileText, Trash2, Wand2, Send,
 } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────────────
@@ -85,6 +85,18 @@ function parsePackageJson(content: string): string {
   }
 }
 
+// ── Refine suggestions ─────────────────────────────────────────
+const REFINE_SUGGESTIONS = [
+  'Más detallado',
+  'Más corto y directo',
+  'Enfócate en accesibilidad',
+  'Añade manejo de errores',
+  'Incluye TypeScript types',
+  'Mobile-first',
+  'Más ejemplos de código',
+  'Sin librerías extra',
+]
+
 // ── Main Component ─────────────────────────────────────────────
 export default function PromptGenerator() {
   // Form
@@ -94,11 +106,10 @@ export default function PromptGenerator() {
   const [section, setSection]           = useState('')
   const [extra, setExtra]               = useState('')
 
-  // Context — loaded from localStorage on mount
+  // Context
   const [projectContext, setProjectContext] = useState<ProjectContext>(EMPTY_CONTEXT)
   const [contextOpen, setContextOpen]       = useState(false)
   const [activeCtxField, setActiveCtxField] = useState<keyof ProjectContext | null>(null)
-  const [contextSaved, setContextSaved]     = useState(false)
 
   // Output
   const [result, setResult]   = useState('')
@@ -106,16 +117,23 @@ export default function PromptGenerator() {
   const [copied, setCopied]   = useState(false)
   const [error, setError]     = useState('')
 
-  // History — loaded from localStorage on mount
+  // Refinement
+  const [refineInput, setRefineInput]   = useState('')
+  const [refining, setRefining]         = useState(false)
+  const [refineCount, setRefineCount]   = useState(0)
+
+  // History
   const [history, setHistory]         = useState<HistoryItem[]>([])
   const [showHistory, setShowHistory] = useState(false)
 
-  // File drag state
-  const [draggingOver, setDraggingOver] = useState<keyof ProjectContext | null>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  // File drag
+  const [draggingOver, setDraggingOver]     = useState<keyof ProjectContext | null>(null)
+  const fileInputRef                        = useRef<HTMLInputElement>(null)
   const [fileTargetField, setFileTargetField] = useState<keyof ProjectContext | null>(null)
+  const refineInputRef                      = useRef<HTMLInputElement>(null)
+  const resultRef                           = useRef<HTMLDivElement>(null)
 
-  // ── Hydration: load from localStorage ──
+  // ── Load from localStorage ──
   useEffect(() => {
     try {
       const savedCtx  = localStorage.getItem(STORAGE_KEY_CTX)
@@ -125,15 +143,20 @@ export default function PromptGenerator() {
     } catch {}
   }, [])
 
-  // ── Persist context to localStorage ──
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY_CTX, JSON.stringify(projectContext)) } catch {}
   }, [projectContext])
 
-  // ── Persist history to localStorage ──
   useEffect(() => {
     try { localStorage.setItem(STORAGE_KEY_HIST, JSON.stringify(history)) } catch {}
   }, [history])
+
+  // Auto-scroll result panel when streaming
+  useEffect(() => {
+    if (loading || refining) {
+      resultRef.current?.scrollTo({ top: resultRef.current.scrollHeight, behavior: 'smooth' })
+    }
+  }, [result, loading, refining])
 
   const needsSection   = ['section','functionality','styling','refactor','content'].includes(selectedType)
   const filledCtxCount = Object.values(projectContext).filter(v => v.trim()).length
@@ -146,11 +169,6 @@ export default function PromptGenerator() {
   function clearContext() {
     setProjectContext(EMPTY_CONTEXT)
     try { localStorage.removeItem(STORAGE_KEY_CTX) } catch {}
-  }
-
-  function saveContextBadge() {
-    setContextSaved(true)
-    setTimeout(() => setContextSaved(false), 2000)
   }
 
   // ── File handling ──
@@ -166,48 +184,101 @@ export default function PromptGenerator() {
   }
 
   function handleDragOver(e: React.DragEvent, key: keyof ProjectContext) {
-    e.preventDefault()
-    setDraggingOver(key)
+    e.preventDefault(); setDraggingOver(key)
   }
-
   function handleDrop(e: React.DragEvent, key: keyof ProjectContext) {
-    e.preventDefault()
-    setDraggingOver(null)
+    e.preventDefault(); setDraggingOver(null)
     const file = e.dataTransfer.files[0]
     if (file) handleFileDrop(key, file)
   }
-
   function triggerFileInput(key: keyof ProjectContext) {
-    setFileTargetField(key)
-    fileInputRef.current?.click()
+    setFileTargetField(key); fileInputRef.current?.click()
   }
-
   function onFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (file && fileTargetField) handleFileDrop(fileTargetField, file)
     e.target.value = ''
   }
 
+  // ── Stream reader helper ──
+  async function readStream(
+    response: Response,
+    onChunk: (text: string) => void
+  ): Promise<string> {
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ error: 'Unknown error' }))
+      throw new Error(err.error || 'Request failed')
+    }
+    const reader  = response.body!.getReader()
+    const decoder = new TextDecoder()
+    let full = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const chunk = decoder.decode(value, { stream: true })
+      full += chunk
+      onChunk(full)
+    }
+    return full
+  }
+
   // ── Generate ──
   async function handleGenerate() {
     if (!description.trim()) { setError('Please describe what you want to build.'); return }
-    setError(''); setLoading(true); setResult('')
+    setError(''); setLoading(true); setResult(''); setRefineCount(0); setRefineInput('')
     try {
-      const res  = await fetch('/api/generate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: selectedType, framework, description, section, extra, projectContext: hasContext ? projectContext : undefined }),
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: selectedType, framework, description, section, extra,
+          projectContext: hasContext ? projectContext : undefined,
+        }),
       })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Unknown error')
-      setResult(data.prompt)
+      const full = await readStream(res, text => setResult(text))
       const newItem: HistoryItem = {
         id: Date.now().toString(), type: selectedType,
-        description: description.slice(0,60) + (description.length > 60 ? '…' : ''),
-        prompt: data.prompt, timestamp: new Date().toISOString(),
+        description: description.slice(0, 60) + (description.length > 60 ? '…' : ''),
+        prompt: full, timestamp: new Date().toISOString(),
       }
       setHistory(p => [newItem, ...p.slice(0, 49)])
-    } catch (e: any) { setError(e.message || 'Something went wrong.') }
-    finally { setLoading(false) }
+    } catch (e: any) {
+      setError(e.message || 'Something went wrong.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // ── Refine ──
+  async function handleRefine(instruction?: string) {
+    const req = instruction ?? refineInput.trim()
+    if (!req || !result) return
+    setError(''); setRefining(true); setRefineInput('')
+    try {
+      const res = await fetch('/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: selectedType, framework, description, section, extra,
+          projectContext: hasContext ? projectContext : undefined,
+          refineRequest: req,
+          currentPrompt: result,
+        }),
+      })
+      const full = await readStream(res, text => setResult(text))
+      setRefineCount(c => c + 1)
+      // Update history entry
+      setHistory(p => {
+        const [first, ...rest] = p
+        if (!first) return p
+        return [{ ...first, prompt: full }, ...rest]
+      })
+    } catch (e: any) {
+      setError(e.message || 'Something went wrong.')
+    } finally {
+      setRefining(false)
+      setTimeout(() => refineInputRef.current?.focus(), 50)
+    }
   }
 
   async function handleCopy() {
@@ -215,10 +286,14 @@ export default function PromptGenerator() {
     setCopied(true); setTimeout(() => setCopied(false), 2000)
   }
 
+  function handleReset() {
+    setDescription(''); setSection(''); setExtra('')
+    setResult(''); setError(''); setRefineCount(0); setRefineInput('')
+  }
+
   // ── Render ──
   return (
     <div className="min-h-screen bg-bg">
-      {/* Hidden file input */}
       <input ref={fileInputRef} type="file" className="hidden" onChange={onFileInputChange}
         accept=".json,.ts,.tsx,.js,.jsx,.css,.md,.env,.txt" />
 
@@ -274,7 +349,6 @@ export default function PromptGenerator() {
 
           {contextOpen && (
             <div className="border-t border-border animate-fade-in">
-              {/* Tabs */}
               <div className="flex overflow-x-auto border-b border-border bg-bg/50 px-4 gap-1 pt-2">
                 {CONTEXT_FIELDS.map(f => {
                   const filled = projectContext[f.key].trim().length > 0
@@ -292,7 +366,6 @@ export default function PromptGenerator() {
               </div>
 
               {activeCtxField ? (
-                // ── Field editor with drag & drop ──
                 <div className="p-5 animate-fade-in">
                   {CONTEXT_FIELDS.filter(f => f.key === activeCtxField).map(f => (
                     <div key={f.key}>
@@ -310,8 +383,6 @@ export default function PromptGenerator() {
                           )}
                         </div>
                       </div>
-
-                      {/* Drop zone wrapper */}
                       <div
                         onDragOver={f.acceptFiles ? e => handleDragOver(e, f.key) : undefined}
                         onDragLeave={f.acceptFiles ? () => setDraggingOver(null) : undefined}
@@ -338,7 +409,6 @@ export default function PromptGenerator() {
                           </div>
                         )}
                       </div>
-
                       {projectContext[f.key] && (
                         <p className="text-dim font-mono text-xs mt-1.5">
                           {projectContext[f.key].split('\n').length} lines · auto-saved
@@ -348,7 +418,6 @@ export default function PromptGenerator() {
                   ))}
                 </div>
               ) : (
-                // ── Field overview grid ──
                 <div className="px-5 py-6 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
                   {CONTEXT_FIELDS.map(f => {
                     const filled = projectContext[f.key].trim().length > 0
@@ -450,15 +519,15 @@ export default function PromptGenerator() {
             {error && <p className="text-red-400 text-xs font-mono border border-red-400/20 bg-red-400/5 px-3 py-2 rounded-lg">⚠ {error}</p>}
 
             <div className="flex gap-3">
-              <button onClick={handleGenerate} disabled={loading}
+              <button onClick={handleGenerate} disabled={loading || refining}
                 className="flex-1 flex items-center justify-center gap-2 bg-accent text-bg font-sans font-bold py-3 px-6 rounded-lg hover:bg-accent/90 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                 {loading
                   ? <><span className="animate-pulse-slow">Generating</span><span className="animate-pulse font-mono">···</span></>
                   : <><Sparkles size={16} />Generate Prompt{hasContext && <span className="text-bg/60 font-mono text-xs font-normal">with context</span>}</>}
               </button>
               {(description || result) && (
-                <button onClick={() => { setDescription(''); setSection(''); setExtra(''); setResult(''); setError('') }}
-                  className="p-3 border border-border text-dim hover:text-text hover:border-muted rounded-lg transition-all" title="Reset form">
+                <button onClick={handleReset} disabled={loading || refining}
+                  className="p-3 border border-border text-dim hover:text-text hover:border-muted rounded-lg transition-all disabled:opacity-40" title="Reset form">
                   <RotateCcw size={16} />
                 </button>
               )}
@@ -481,23 +550,42 @@ export default function PromptGenerator() {
                 </div>
                 <div className="flex flex-col gap-2 max-h-[560px] overflow-y-auto pr-1">
                   {history.map(item => (
-                    <button key={item.id} onClick={() => { setResult(item.prompt); setShowHistory(false) }}
-                      className="text-left p-3 bg-surface border border-border rounded-lg hover:border-muted transition-all group">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-accent font-mono text-xs">{PROMPT_TYPES.find(t=>t.id===item.type)?.emoji} {item.type}</span>
-                        <span className="text-dim font-mono text-xs ml-auto">
-                          {new Date(item.timestamp).toLocaleDateString([], { month:'short', day:'numeric' })} {new Date(item.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
-                        </span>
-                      </div>
-                      <p className="text-dim text-xs font-mono group-hover:text-text transition-colors">{item.description}</p>
-                    </button>
+                    <div key={item.id} className="flex items-start gap-2 group">
+                      <button onClick={() => { setResult(item.prompt); setShowHistory(false); setRefineCount(0) }}
+                        className="flex-1 text-left p-3 bg-surface border border-border rounded-lg hover:border-muted transition-all">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-accent font-mono text-xs">{PROMPT_TYPES.find(t=>t.id===item.type)?.emoji} {item.type}</span>
+                          <span className="text-dim font-mono text-xs ml-auto">
+                            {new Date(item.timestamp).toLocaleDateString([], { month:'short', day:'numeric' })} {new Date(item.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
+                          </span>
+                        </div>
+                        <p className="text-dim text-xs font-mono group-hover:text-text transition-colors">{item.description}</p>
+                      </button>
+                      {/* Copy direct desde historial */}
+                      <button
+                        onClick={async () => { await navigator.clipboard.writeText(item.prompt) }}
+                        className="p-2.5 border border-border text-dim hover:text-accent hover:border-accent/40 rounded-lg transition-all opacity-0 group-hover:opacity-100 mt-0.5"
+                        title="Copy prompt">
+                        <Copy size={13} />
+                      </button>
+                    </div>
                   ))}
                 </div>
               </div>
             ) : (
               <>
+                {/* Result header */}
                 <div className="flex items-center justify-between">
-                  <h2 className="font-sans font-semibold text-sm text-text">{result ? 'Your prompt is ready ✓' : 'Generated prompt'}</h2>
+                  <div className="flex items-center gap-2">
+                    <h2 className="font-sans font-semibold text-sm text-text">
+                      {result ? 'Your prompt is ready ✓' : 'Generated prompt'}
+                    </h2>
+                    {refineCount > 0 && (
+                      <span className="flex items-center gap-1 text-accent font-mono text-xs border border-accent/30 bg-accent/5 px-2 py-0.5 rounded-full">
+                        <Wand2 size={10} />{refineCount} refinement{refineCount > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
                   <div className="flex items-center gap-2">
                     {history.length > 0 && (
                       <button onClick={() => setShowHistory(true)}
@@ -515,13 +603,13 @@ export default function PromptGenerator() {
                   </div>
                 </div>
 
-                <div className={`flex-1 min-h-[520px] bg-surface border rounded-xl p-5 font-mono text-sm leading-relaxed transition-all ${result ? 'border-border text-text' : 'border-border/50 text-dim'}`}>
+                {/* Result box */}
+                <div ref={resultRef}
+                  className={`flex-1 min-h-[400px] max-h-[480px] overflow-y-auto bg-surface border rounded-xl p-5 font-mono text-sm leading-relaxed transition-all ${result ? 'border-border text-text' : 'border-border/50 text-dim'}`}>
                   {loading ? (
-                    <div className="flex flex-col gap-3 pt-4 animate-pulse">
-                      {[100,85,70,100,75,90,60,100,80,65,90,70,55,95].map((w,i) => (
-                        <div key={i} className="h-3 bg-muted rounded" style={{width:`${w}%`}} />
-                      ))}
-                    </div>
+                    <pre className="whitespace-pre-wrap break-words text-text animate-pulse-slow">{result}<span className="inline-block w-2 h-4 bg-accent/70 ml-0.5 animate-pulse align-middle" /></pre>
+                  ) : refining ? (
+                    <pre className="whitespace-pre-wrap break-words text-text">{result}<span className="inline-block w-2 h-4 bg-accent/70 ml-0.5 animate-pulse align-middle" /></pre>
                   ) : result ? (
                     <pre className="whitespace-pre-wrap break-words animate-slide-up">{result}</pre>
                   ) : (
@@ -536,10 +624,46 @@ export default function PromptGenerator() {
                   )}
                 </div>
 
-                {result && (
-                  <p className="text-dim text-xs font-mono text-center animate-fade-in">
-                    Paste directly into Claude, ChatGPT, Cursor or any AI tool →
-                  </p>
+                {/* ── Refinement panel ── */}
+                {result && !loading && (
+                  <div className="flex flex-col gap-3 animate-fade-in">
+                    {/* Quick suggestions */}
+                    <div className="flex flex-wrap gap-1.5">
+                      {REFINE_SUGGESTIONS.map(s => (
+                        <button key={s} onClick={() => handleRefine(s)} disabled={refining}
+                          className="text-xs font-mono px-2.5 py-1 rounded-full border border-border text-dim hover:border-accent/50 hover:text-accent hover:bg-accent/5 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Custom refine input */}
+                    <div className="flex gap-2">
+                      <div className="flex-1 flex items-center gap-2 bg-surface border border-border rounded-lg px-3 py-2 focus-within:border-accent/50 transition-colors">
+                        <Wand2 size={14} className="text-dim shrink-0" />
+                        <input
+                          ref={refineInputRef}
+                          type="text"
+                          value={refineInput}
+                          onChange={e => setRefineInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleRefine() } }}
+                          placeholder="Refine: más detallado, añade X, sin Y…"
+                          disabled={refining}
+                          className="flex-1 bg-transparent text-sm font-mono text-text placeholder:text-muted focus:outline-none disabled:opacity-40"
+                        />
+                      </div>
+                      <button onClick={() => handleRefine()} disabled={refining || !refineInput.trim()}
+                        className="flex items-center gap-1.5 px-4 py-2 bg-accent/10 border border-accent/30 text-accent font-mono text-xs rounded-lg hover:bg-accent/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                        {refining
+                          ? <span className="animate-pulse">···</span>
+                          : <><Send size={13} /> Refine</>}
+                      </button>
+                    </div>
+
+                    <p className="text-dim text-xs font-mono text-center">
+                      Paste directly into Claude, ChatGPT, Cursor or any AI tool →
+                    </p>
+                  </div>
                 )}
               </>
             )}
