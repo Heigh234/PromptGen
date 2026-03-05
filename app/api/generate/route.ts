@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
     const userMessage = buildUserMessage({ type, framework, description, section, extra, projectContext })
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-3.1-pro',
       systemInstruction: SYSTEM_PROMPT,
     })
 
