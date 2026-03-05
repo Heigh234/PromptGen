@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
     }
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-3.1-pro',
+      model: 'gemini-1.5-pro',
       systemInstruction: SYSTEM_PROMPT,
     })
 
