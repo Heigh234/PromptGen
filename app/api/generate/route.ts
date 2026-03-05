@@ -1,5 +1,5 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
 
@@ -19,60 +19,27 @@ Rules for the generated prompt:
 
 Output ONLY the prompt text. Nothing else.`
 
-export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json()
-    const { type, framework, description, section, extra, projectContext } = body
-
-    if (!description) {
-      return NextResponse.json({ error: 'Description is required' }, { status: 400 })
-    }
-
-    const userMessage = buildUserMessage({ type, framework, description, section, extra, projectContext })
-
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-3.1-pro',
-      systemInstruction: SYSTEM_PROMPT,
-    })
-
-    const result = await model.generateContent(userMessage)
-    const text = result.response.text()
-
-    return NextResponse.json({ prompt: text })
-  } catch (error: any) {
-    console.error('[Gemini Error]', error)
-    return NextResponse.json(
-      { error: error.message || 'Failed to generate prompt' },
-      { status: 500 }
-    )
-  }
+type ProjectContext = {
+  overview?: string
+  stack?: string
+  folderStructure?: string
+  codeSnippets?: string
+  conventions?: string
+  designSystem?: string
+  existingRoutes?: string
 }
 
 function buildUserMessage({
-  type,
-  framework,
-  description,
-  section,
-  extra,
-  projectContext,
+  type, framework, description, section, extra, projectContext,
 }: {
   type: string
   framework: string
   description: string
   section?: string
   extra?: string
-  projectContext?: {
-    overview?: string
-    stack?: string
-    folderStructure?: string
-    codeSnippets?: string
-    conventions?: string
-    designSystem?: string
-    existingRoutes?: string
-  }
+  projectContext?: ProjectContext
 }) {
   const lines: string[] = []
-
   lines.push('=== TASK ===')
   lines.push(`Type: ${type}`)
   lines.push(`Framework/Stack: ${framework}`)
@@ -85,7 +52,6 @@ function buildUserMessage({
     lines.push('')
     lines.push('=== PROJECT CONTEXT ===')
     lines.push('Use this context to make the generated prompt as specific and accurate as possible.')
-
     if (ctx.overview?.trim())        lines.push(`\nProject overview:\n${ctx.overview}`)
     if (ctx.stack?.trim())           lines.push(`\nStack & dependencies:\n${ctx.stack}`)
     if (ctx.folderStructure?.trim()) lines.push(`\nFolder structure:\n${ctx.folderStructure}`)
@@ -94,6 +60,74 @@ function buildUserMessage({
     if (ctx.conventions?.trim())     lines.push(`\nConventions & rules:\n${ctx.conventions}`)
     if (ctx.codeSnippets?.trim())    lines.push(`\nCode snippets (components, config, etc.):\n${ctx.codeSnippets}`)
   }
-
   return lines.join('\n')
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json()
+    const { type, framework, description, section, extra, projectContext, refineRequest, currentPrompt } = body
+
+    if (!description) {
+      return new Response(JSON.stringify({ error: 'Description is required' }), { status: 400 })
+    }
+
+    const model = genAI.getGenerativeModel({
+      model: 'gemini-3.1-pro',
+      systemInstruction: SYSTEM_PROMPT,
+    })
+
+    let streamResult
+
+    if (refineRequest && currentPrompt) {
+      // Refinement mode: multi-turn chat with history
+      const chat = model.startChat({
+        history: [
+          {
+            role: 'user',
+            parts: [{ text: buildUserMessage({ type, framework, description, section, extra, projectContext }) }],
+          },
+          {
+            role: 'model',
+            parts: [{ text: currentPrompt }],
+          },
+        ],
+      })
+      streamResult = await chat.sendMessageStream(
+        `Refine the prompt you just generated with this instruction: ${refineRequest}\n\nOutput ONLY the updated prompt text. Nothing else.`
+      )
+    } else {
+      // Normal generation mode
+      streamResult = await model.generateContentStream(
+        buildUserMessage({ type, framework, description, section, extra, projectContext })
+      )
+    }
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of streamResult.stream) {
+            const text = chunk.text()
+            if (text) controller.enqueue(new TextEncoder().encode(text))
+          }
+        } finally {
+          controller.close()
+        }
+      },
+    })
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Transfer-Encoding': 'chunked',
+        'X-Content-Type-Options': 'nosniff',
+      },
+    })
+  } catch (error: any) {
+    console.error('[Gemini Error]', error)
+    return new Response(
+      JSON.stringify({ error: error.message || 'Failed to generate prompt' }),
+      { status: 500 }
+    )
+  }
 }
